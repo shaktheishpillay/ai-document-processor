@@ -1,0 +1,155 @@
+"""
+Data export endpoint
+"""
+from fastapi import APIRouter, HTTPException, Depends
+from fastapi.responses import FileResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+import pandas as pd
+from pathlib import Path
+from datetime import datetime
+import json
+import logging
+
+from database import get_db, Document
+from config import settings
+from schemas import ExportRequest, ExportResponse
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+@router.post("/export", response_model=ExportResponse)
+async def export_documents(
+    request: ExportRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Export document data to CSV, Excel, or JSON
+    """
+    try:
+        # Get documents
+        result = await db.execute(
+            select(Document).where(Document.id.in_(request.document_ids))
+        )
+        documents = result.scalars().all()
+        
+        if not documents:
+            raise HTTPException(
+                status_code=404,
+                detail="No documents found with provided IDs"
+            )
+        
+        # Prepare data for export
+        export_data = []
+        for doc in documents:
+            row = {
+                "document_id": doc.id,
+                "filename": doc.original_filename,
+                "document_type": doc.document_type or "unknown",
+                "status": doc.status,
+                "created_at": doc.created_at.isoformat() if doc.created_at else None,
+                "processed_at": doc.processed_at.isoformat() if doc.processed_at else None,
+            }
+            
+            # Add confidence score if requested
+            if request.include_confidence_scores:
+                row["confidence_score"] = doc.confidence_score
+            
+            # Add extracted fields
+            if doc.extracted_data and isinstance(doc.extracted_data, dict):
+                fields = doc.extracted_data.get("fields", [])
+                for field in fields:
+                    field_name = field.get("field_name", "unknown")
+                    field_value = field.get("value", "")
+                    row[field_name] = field_value
+                    
+                    if request.include_confidence_scores:
+                        row[f"{field_name}_confidence"] = field.get("confidence", 0.0)
+            
+            # Add metadata if requested
+            if doc.extracted_data:
+                metadata = doc.extracted_data.get("metadata", {})
+                row["metadata"] = json.dumps(metadata)
+            
+            export_data.append(row)
+        
+        # Create DataFrame
+        df = pd.DataFrame(export_data)
+        
+        # Generate filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"export_{timestamp}.{request.export_format}"
+        export_path = Path(settings.EXPORT_DIR) / filename
+        
+        # Export based on format
+        if request.export_format == "csv":
+            df.to_csv(export_path, index=False)
+        elif request.export_format == "excel":
+            df.to_excel(export_path, index=False, engine='openpyxl')
+        elif request.export_format == "json":
+            df.to_json(export_path, orient='records', indent=2)
+        
+        logger.info(f"Exported {len(documents)} documents to {filename}")
+        
+        # Update documents as exported
+        for doc in documents:
+            doc.exported = "true"
+            doc.export_path = str(export_path)
+        await db.commit()
+        
+        return ExportResponse(
+            export_path=str(export_path),
+            filename=filename,
+            total_records=len(documents),
+            format=request.export_format,
+            download_url=f"/api/export/download/{filename}",
+            message=f"Successfully exported {len(documents)} documents"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Export failed: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Export failed: {str(e)}"
+        )
+
+
+@router.get("/export/download/{filename}")
+async def download_export(filename: str):
+    """
+    Download exported file
+    """
+    try:
+        file_path = Path(settings.EXPORT_DIR) / filename
+        
+        if not file_path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail="Export file not found"
+            )
+        
+        # Determine media type
+        media_type_map = {
+            '.csv': 'text/csv',
+            '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            '.json': 'application/json'
+        }
+        media_type = media_type_map.get(file_path.suffix, 'application/octet-stream')
+        
+        return FileResponse(
+            path=file_path,
+            filename=filename,
+            media_type=media_type
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Download failed: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Download failed: {str(e)}"
+        )

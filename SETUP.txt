@@ -1,0 +1,12 @@
+COMPLETE FIXED VERSION - SETUP INSTRUCTIONS
+=============================================
+
+1. Extract this zip file
+2. cd into ai-doc-complete folder
+3. Edit .env and add your OpenAI API key
+4. Run: ./run.sh
+5. Open: http://localhost:3000
+
+STOP: ./stop.sh
+
+This version has ALL imports fixed and ALL schemas included.
